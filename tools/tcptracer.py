@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 #
 # tcpv4tracer   Trace TCP connections.
 #               For Linux, uses BCC, eBPF. Embedded C.
@@ -11,14 +11,14 @@
 # The following code should be replaced, and simplified, when static TCP probes
 # exist.
 #
-# Copyright 2017 Kinvolk GmbH
+# Copyright 2017-2020 Kinvolk GmbH
 #
 # Licensed under the Apache License, Version 2.0 (the "License")
 from __future__ import print_function
 from bcc import BPF
+from bcc.containers import filter_by_containers
 
 import argparse as ap
-import ctypes
 from socket import inet_ntop, AF_INET, AF_INET6
 from struct import pack
 
@@ -30,6 +30,10 @@ parser.add_argument("-p", "--pid", default=0, type=int,
                     help="trace this PID only")
 parser.add_argument("-N", "--netns", default=0, type=int,
                     help="trace this Network Namespace only")
+parser.add_argument("--cgroupmap",
+                    help="trace cgroups in this BPF map only")
+parser.add_argument("--mntnsmap",
+                    help="trace mount namespaces in this BPF map only")
 parser.add_argument("-v", "--verbose", action="store_true",
                     help="include Network Namespace in the output")
 parser.add_argument("--ebpf", action="store_true",
@@ -69,12 +73,12 @@ struct tcp_ipv6_event_t {
     u32 type;
     u32 pid;
     char comm[TASK_COMM_LEN];
-    u8 ip;
     unsigned __int128 saddr;
     unsigned __int128 daddr;
     u16 sport;
     u16 dport;
     u32 netns;
+    u8 ip;
 };
 BPF_PERF_OUTPUT(tcp_ipv6_event);
 
@@ -145,9 +149,9 @@ static int read_ipv6_tuple(struct ipv6_tuple_t *tuple, struct sock *skp)
 #ifdef CONFIG_NET_NS
   net_ns_inum = skp->__sk_common.skc_net.net->ns.inum;
 #endif
-  bpf_probe_read(&saddr, sizeof(saddr),
+  bpf_probe_read_kernel(&saddr, sizeof(saddr),
                  skp->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
-  bpf_probe_read(&daddr, sizeof(daddr),
+  bpf_probe_read_kernel(&daddr, sizeof(daddr),
                  skp->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
 
   ##FILTER_NETNS##
@@ -174,6 +178,10 @@ static bool check_family(struct sock *sk, u16 expected_family) {
 
 int trace_connect_v4_entry(struct pt_regs *ctx, struct sock *sk)
 {
+  if (container_should_be_filtered()) {
+    return 0;
+  }
+
   u64 pid = bpf_get_current_pid_tgid();
 
   ##FILTER_PID##
@@ -221,6 +229,9 @@ int trace_connect_v4_return(struct pt_regs *ctx)
 
 int trace_connect_v6_entry(struct pt_regs *ctx, struct sock *sk)
 {
+  if (container_should_be_filtered()) {
+    return 0;
+  }
   u64 pid = bpf_get_current_pid_tgid();
 
   ##FILTER_PID##
@@ -353,6 +364,10 @@ int trace_tcp_set_state_entry(struct pt_regs *ctx, struct sock *skp, int state)
 
 int trace_close_entry(struct pt_regs *ctx, struct sock *skp)
 {
+  if (container_should_be_filtered()) {
+    return 0;
+  }
+
   u64 pid = bpf_get_current_pid_tgid();
 
   ##FILTER_PID##
@@ -414,6 +429,10 @@ int trace_close_entry(struct pt_regs *ctx, struct sock *skp)
 
 int trace_accept_return(struct pt_regs *ctx)
 {
+  if (container_should_be_filtered()) {
+    return 0;
+  }
+
   struct sock *newsk = (struct sock *)PT_REGS_RC(ctx);
   u64 pid = bpf_get_current_pid_tgid();
 
@@ -472,9 +491,9 @@ int trace_accept_return(struct pt_regs *ctx)
       evt6.pid = pid >> 32;
       evt6.ip = ipver;
 
-      bpf_probe_read(&evt6.saddr, sizeof(evt6.saddr),
+      bpf_probe_read_kernel(&evt6.saddr, sizeof(evt6.saddr),
                      newsk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
-      bpf_probe_read(&evt6.daddr, sizeof(evt6.daddr),
+      bpf_probe_read_kernel(&evt6.daddr, sizeof(evt6.daddr),
                      newsk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
 
       evt6.sport = lport;
@@ -493,45 +512,12 @@ int trace_accept_return(struct pt_regs *ctx)
 }
 """
 
-TASK_COMM_LEN = 16   # linux/sched.h
-
-
-class TCPIPV4Evt(ctypes.Structure):
-    _fields_ = [
-            ("ts_ns", ctypes.c_ulonglong),
-            ("type", ctypes.c_uint),
-            ("pid", ctypes.c_uint),
-            ("comm", ctypes.c_char * TASK_COMM_LEN),
-            ("ip", ctypes.c_ubyte),
-            ("saddr", ctypes.c_uint),
-            ("daddr", ctypes.c_uint),
-            ("sport", ctypes.c_ushort),
-            ("dport", ctypes.c_ushort),
-            ("netns", ctypes.c_uint)
-    ]
-
-
-class TCPIPV6Evt(ctypes.Structure):
-    _fields_ = [
-            ("ts_ns", ctypes.c_ulonglong),
-            ("type", ctypes.c_uint),
-            ("pid", ctypes.c_uint),
-            ("comm", ctypes.c_char * TASK_COMM_LEN),
-            ("ip", ctypes.c_ubyte),
-            ("saddr", (ctypes.c_ulong * 2)),
-            ("daddr", (ctypes.c_ulong * 2)),
-            ("sport", ctypes.c_ushort),
-            ("dport", ctypes.c_ushort),
-            ("netns", ctypes.c_uint)
-    ]
-
-
 verbose_types = {"C": "connect", "A": "accept",
                  "X": "close", "U": "unknown"}
 
 
 def print_ipv4_event(cpu, data, size):
-    event = ctypes.cast(data, ctypes.POINTER(TCPIPV4Evt)).contents
+    event = b["tcp_ipv4_event"].event(data)
     global start_ts
 
     if args.timestamp:
@@ -569,7 +555,7 @@ def print_ipv4_event(cpu, data, size):
 
 
 def print_ipv6_event(cpu, data, size):
-    event = ctypes.cast(data, ctypes.POINTER(TCPIPV6Evt)).contents
+    event = b["tcp_ipv6_event"].event(data)
     global start_ts
     if args.timestamp:
         if start_ts == 0:
@@ -615,6 +601,7 @@ if args.netns:
 
 bpf_text = bpf_text.replace('##FILTER_PID##', pid_filter)
 bpf_text = bpf_text.replace('##FILTER_NETNS##', netns_filter)
+bpf_text = filter_by_containers(args) + bpf_text
 
 if args.ebpf:
     print(bpf_text)

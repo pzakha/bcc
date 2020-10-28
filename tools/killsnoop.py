@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 # @lint-avoid-python-3-compatibility-imports
 #
 # killsnoop Trace signals issued by the kill() syscall.
@@ -17,13 +17,13 @@ from bcc import BPF
 from bcc.utils import ArgString, printb
 import argparse
 from time import strftime
-import ctypes as ct
 
 # arguments
 examples = """examples:
     ./killsnoop           # trace all kill() signals
     ./killsnoop -x        # only show failed kills
     ./killsnoop -p 181    # only trace PID 181
+    ./killsnoop -s 9      # only trace signal 9
 """
 parser = argparse.ArgumentParser(
     description="Trace signals issued by the kill() syscall",
@@ -33,6 +33,8 @@ parser.add_argument("-x", "--failed", action="store_true",
     help="only show failed kill syscalls")
 parser.add_argument("-p", "--pid",
     help="trace this PID only")
+parser.add_argument("-s", "--signal",
+    help="trace this signal only")
 parser.add_argument("--ebpf", action="store_true",
     help=argparse.SUPPRESS)
 args = parser.parse_args()
@@ -64,7 +66,8 @@ BPF_PERF_OUTPUT(events);
 int syscall__kill(struct pt_regs *ctx, int tpid, int sig)
 {
     u32 pid = bpf_get_current_pid_tgid();
-    FILTER
+    PID_FILTER
+    SIGNAL_FILTER
 
     struct val_t val = {.pid = pid};
     if (bpf_get_current_comm(&val.comm, sizeof(val.comm)) == 0) {
@@ -88,7 +91,7 @@ int do_ret_sys_kill(struct pt_regs *ctx)
         return 0;
     }
 
-    bpf_probe_read(&data.comm, sizeof(data.comm), valp->comm);
+    bpf_probe_read_kernel(&data.comm, sizeof(data.comm), valp->comm);
     data.pid = pid;
     data.tpid = valp->tpid;
     data.ret = PT_REGS_RC(ctx);
@@ -101,10 +104,15 @@ int do_ret_sys_kill(struct pt_regs *ctx)
 }
 """
 if args.pid:
-    bpf_text = bpf_text.replace('FILTER',
+    bpf_text = bpf_text.replace('PID_FILTER',
         'if (pid != %s) { return 0; }' % args.pid)
 else:
-    bpf_text = bpf_text.replace('FILTER', '')
+    bpf_text = bpf_text.replace('PID_FILTER', '')
+if args.signal:
+    bpf_text = bpf_text.replace('SIGNAL_FILTER',
+        'if (sig != %s) { return 0; }' % args.signal)
+else:
+    bpf_text = bpf_text.replace('SIGNAL_FILTER', '')
 if debug or args.ebpf:
     print(bpf_text)
     if args.ebpf:
@@ -116,25 +124,13 @@ kill_fnname = b.get_syscall_fnname("kill")
 b.attach_kprobe(event=kill_fnname, fn_name="syscall__kill")
 b.attach_kretprobe(event=kill_fnname, fn_name="do_ret_sys_kill")
 
-
-TASK_COMM_LEN = 16    # linux/sched.h
-
-class Data(ct.Structure):
-    _fields_ = [
-        ("pid", ct.c_ulonglong),
-        ("tpid", ct.c_int),
-        ("sig", ct.c_int),
-        ("ret", ct.c_int),
-        ("comm", ct.c_char * TASK_COMM_LEN)
-    ]
-
 # header
 print("%-9s %-6s %-16s %-4s %-6s %s" % (
     "TIME", "PID", "COMM", "SIG", "TPID", "RESULT"))
 
 # process event
 def print_event(cpu, data, size):
-    event = ct.cast(data, ct.POINTER(Data)).contents
+    event = b["events"].event(data)
 
     if (args.failed and (event.ret >= 0)):
         return

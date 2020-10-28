@@ -117,7 +117,12 @@ void SourceDebugger::dump() {
     errs() << "Debug Error: cannot get register info\n";
     return;
   }
+#if LLVM_MAJOR_VERSION >= 10
+  MCTargetOptions MCOptions;
+  std::unique_ptr<MCAsmInfo> MAI(T->createMCAsmInfo(*MRI, TripleStr, MCOptions));
+#else
   std::unique_ptr<MCAsmInfo> MAI(T->createMCAsmInfo(*MRI, TripleStr));
+#endif
   if (!MAI) {
     errs() << "Debug Error: cannot get assembly info\n";
     return;
@@ -183,6 +188,9 @@ void SourceDebugger::dump() {
       uint64_t Size;
       uint8_t *FuncStart = get<0>(section.second);
       uint64_t FuncSize = get<1>(section.second);
+#if LLVM_MAJOR_VERSION >= 9
+      unsigned SectionID = get<2>(section.second);
+#endif
       ArrayRef<uint8_t> Data(FuncStart, FuncSize);
       uint32_t CurrentSrcLine = 0;
       string func_name = section.first.substr(fn_prefix_.size());
@@ -193,16 +201,27 @@ void SourceDebugger::dump() {
       string src_dbg_str;
       llvm::raw_string_ostream os(src_dbg_str);
       for (uint64_t Index = 0; Index < FuncSize; Index += Size) {
+#if LLVM_MAJOR_VERSION >= 10
+        S = DisAsm->getInstruction(Inst, Size, Data.slice(Index), Index,
+                                   nulls());
+#else
         S = DisAsm->getInstruction(Inst, Size, Data.slice(Index), Index,
                                    nulls(), nulls());
+#endif
         if (S != MCDisassembler::Success) {
           os << "Debug Error: disassembler failed: " << std::to_string(S)
              << '\n';
           break;
         } else {
           DILineInfo LineInfo;
+
           LineTable->getFileLineInfoForAddress(
-              (uint64_t)FuncStart + Index, CU->getCompilationDir(),
+#if LLVM_MAJOR_VERSION >= 9
+              {(uint64_t)FuncStart + Index, SectionID},
+#else
+              (uint64_t)FuncStart + Index,
+#endif
+              CU->getCompilationDir(),
               DILineInfoSpecifier::FileLineInfoKind::AbsoluteFilePath,
               LineInfo);
 
@@ -211,7 +230,11 @@ void SourceDebugger::dump() {
                       CurrentSrcLine, os);
           os << format("%4" PRIu64 ":", Index >> 3) << '\t';
           dumpBytes(Data.slice(Index, Size), os);
+#if LLVM_MAJOR_VERSION >= 10
+          IP->printInst(&Inst, 0, "", *STI, os);
+#else
           IP->printInst(&Inst, os, "", *STI);
+#endif
           os << '\n';
         }
       }

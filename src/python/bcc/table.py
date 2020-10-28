@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import MutableMapping
+from __future__ import print_function
+try:
+    from collections.abc import MutableMapping
+except ImportError:
+    from collections import MutableMapping
 import ctypes as ct
 from functools import reduce
 import multiprocessing
 import os
 import errno
+import re
+import sys
 
-from .libbcc import lib, _RAW_CB_TYPE, _LOST_CB_TYPE
+from .libbcc import lib, _RAW_CB_TYPE, _LOST_CB_TYPE, _RINGBUF_CB_TYPE
 from .perf import Perf
 from .utils import get_online_cpus
 from .utils import get_possible_cpus
@@ -43,6 +49,43 @@ BPF_MAP_TYPE_SOCKMAP = 15
 BPF_MAP_TYPE_CPUMAP = 16
 BPF_MAP_TYPE_XSKMAP = 17
 BPF_MAP_TYPE_SOCKHASH = 18
+BPF_MAP_TYPE_CGROUP_STORAGE = 19
+BPF_MAP_TYPE_REUSEPORT_SOCKARRAY = 20
+BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE = 21
+BPF_MAP_TYPE_QUEUE = 22
+BPF_MAP_TYPE_STACK = 23
+BPF_MAP_TYPE_SK_STORAGE = 24
+BPF_MAP_TYPE_DEVMAP_HASH = 25
+BPF_MAP_TYPE_STRUCT_OPS = 26
+BPF_MAP_TYPE_RINGBUF = 27
+
+map_type_name = {BPF_MAP_TYPE_HASH: "HASH",
+                 BPF_MAP_TYPE_ARRAY: "ARRAY",
+                 BPF_MAP_TYPE_PROG_ARRAY: "PROG_ARRAY",
+                 BPF_MAP_TYPE_PERF_EVENT_ARRAY: "PERF_EVENT_ARRAY",
+                 BPF_MAP_TYPE_PERCPU_HASH: "PERCPU_HASH",
+                 BPF_MAP_TYPE_PERCPU_ARRAY: "PERCPU_ARRAY",
+                 BPF_MAP_TYPE_STACK_TRACE: "STACK_TRACE",
+                 BPF_MAP_TYPE_CGROUP_ARRAY: "CGROUP_ARRAY",
+                 BPF_MAP_TYPE_LRU_HASH: "LRU_HASH",
+                 BPF_MAP_TYPE_LRU_PERCPU_HASH: "LRU_PERCPU_HASH",
+                 BPF_MAP_TYPE_LPM_TRIE: "LPM_TRIE",
+                 BPF_MAP_TYPE_ARRAY_OF_MAPS: "ARRAY_OF_MAPS",
+                 BPF_MAP_TYPE_HASH_OF_MAPS: "HASH_OF_MAPS",
+                 BPF_MAP_TYPE_DEVMAP: "DEVMAP",
+                 BPF_MAP_TYPE_SOCKMAP: "SOCKMAP",
+                 BPF_MAP_TYPE_CPUMAP: "CPUMAP",
+                 BPF_MAP_TYPE_XSKMAP: "XSKMAP",
+                 BPF_MAP_TYPE_SOCKHASH: "SOCKHASH",
+                 BPF_MAP_TYPE_CGROUP_STORAGE: "CGROUP_STORAGE",
+                 BPF_MAP_TYPE_REUSEPORT_SOCKARRAY: "REUSEPORT_SOCKARRAY",
+                 BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE: "PERCPU_CGROUP_STORAGE",
+                 BPF_MAP_TYPE_QUEUE: "QUEUE",
+                 BPF_MAP_TYPE_STACK: "STACK",
+                 BPF_MAP_TYPE_SK_STORAGE: "SK_STORAGE",
+                 BPF_MAP_TYPE_DEVMAP_HASH: "DEVMAP_HASH",
+                 BPF_MAP_TYPE_STRUCT_OPS: "STRUCT_OPS",
+                 BPF_MAP_TYPE_RINGBUF: "RINGBUF",}
 
 stars_max = 40
 log2_index_max = 65
@@ -122,7 +165,71 @@ def _print_linear_hist(vals, val_type):
                       _stars(val, val_max, stars)))
 
 
-def Table(bpf, map_id, map_fd, keytype, leaftype, **kwargs):
+def get_table_type_name(ttype):
+    try:
+        return map_type_name[ttype]
+    except KeyError:
+        return "<unknown>"
+
+
+def _get_event_class(event_map):
+    ct_mapping = { 'char'              : ct.c_char,
+                   's8'                : ct.c_char,
+                   'unsigned char'     : ct.c_ubyte,
+                   'u8'                : ct.c_ubyte,
+                   'u8 *'              : ct.c_char_p,
+                   'char *'            : ct.c_char_p,
+                   'short'             : ct.c_short,
+                   's16'               : ct.c_short,
+                   'unsigned short'    : ct.c_ushort,
+                   'u16'               : ct.c_ushort,
+                   'int'               : ct.c_int,
+                   's32'               : ct.c_int,
+                   'enum'              : ct.c_int,
+                   'unsigned int'      : ct.c_uint,
+                   'u32'               : ct.c_uint,
+                   'long'              : ct.c_long,
+                   'unsigned long'     : ct.c_ulong,
+                   'long long'         : ct.c_longlong,
+                   's64'               : ct.c_longlong,
+                   'unsigned long long': ct.c_ulonglong,
+                   'u64'               : ct.c_ulonglong,
+                   '__int128'          : (ct.c_longlong * 2),
+                   'unsigned __int128' : (ct.c_ulonglong * 2),
+                   'void *'            : ct.c_void_p }
+
+    # handle array types e.g. "int [16] foo"
+    array_type = re.compile(r"(.+) \[([0-9]+)\]$")
+
+    fields = []
+    num_fields = lib.bpf_perf_event_fields(event_map.bpf.module, event_map._name)
+    i = 0
+    while i < num_fields:
+        field = lib.bpf_perf_event_field(event_map.bpf.module, event_map._name, i).decode()
+        m = re.match(r"(.*)#(.*)", field)
+        field_name = m.group(1)
+        field_type = m.group(2)
+
+        if re.match(r"enum .*", field_type):
+            field_type = "enum"
+
+        m = array_type.match(field_type)
+        try:
+            if m:
+                fields.append((field_name, ct_mapping[m.group(1)] * int(m.group(2))))
+            else:
+                fields.append((field_name, ct_mapping[field_type]))
+        except KeyError:
+            # Using print+sys.exit instead of raising exceptions,
+            # because exceptions are caught by the caller.
+            print("Type: '%s' not recognized. Please define the data with ctypes manually."
+                  % field_type, file=sys.stderr)
+            sys.exit(1)
+        i += 1
+    return type('', (ct.Structure,), {'_fields_': fields})
+
+
+def Table(bpf, map_id, map_fd, keytype, leaftype, name, **kwargs):
     """Table(bpf, map_id, map_fd, keytype, leaftype, **kwargs)
 
     Create a python object out of a reference to a bpf table handle"""
@@ -136,7 +243,7 @@ def Table(bpf, map_id, map_fd, keytype, leaftype, **kwargs):
     elif ttype == BPF_MAP_TYPE_PROG_ARRAY:
         t = ProgArray(bpf, map_id, map_fd, keytype, leaftype)
     elif ttype == BPF_MAP_TYPE_PERF_EVENT_ARRAY:
-        t = PerfEventArray(bpf, map_id, map_fd, keytype, leaftype)
+        t = PerfEventArray(bpf, map_id, map_fd, keytype, leaftype, name)
     elif ttype == BPF_MAP_TYPE_PERCPU_HASH:
         t = PerCpuHash(bpf, map_id, map_fd, keytype, leaftype, **kwargs)
     elif ttype == BPF_MAP_TYPE_PERCPU_ARRAY:
@@ -155,6 +262,16 @@ def Table(bpf, map_id, map_fd, keytype, leaftype, **kwargs):
         t = DevMap(bpf, map_id, map_fd, keytype, leaftype)
     elif ttype == BPF_MAP_TYPE_CPUMAP:
         t = CpuMap(bpf, map_id, map_fd, keytype, leaftype)
+    elif ttype == BPF_MAP_TYPE_XSKMAP:
+        t = XskMap(bpf, map_id, map_fd, keytype, leaftype)
+    elif ttype == BPF_MAP_TYPE_ARRAY_OF_MAPS:
+        t = MapInMapArray(bpf, map_id, map_fd, keytype, leaftype)
+    elif ttype == BPF_MAP_TYPE_HASH_OF_MAPS:
+        t = MapInMapHash(bpf, map_id, map_fd, keytype, leaftype)
+    elif ttype == BPF_MAP_TYPE_QUEUE or ttype == BPF_MAP_TYPE_STACK:
+        t = QueueStack(bpf, map_id, map_fd, leaftype)
+    elif ttype == BPF_MAP_TYPE_RINGBUF:
+        t = RingBuf(bpf, map_id, map_fd, keytype, leaftype, name)
     if t == None:
         raise Exception("Unknown table type %d" % ttype)
     return t
@@ -162,7 +279,7 @@ def Table(bpf, map_id, map_fd, keytype, leaftype, **kwargs):
 
 class TableBase(MutableMapping):
 
-    def __init__(self, bpf, map_id, map_fd, keytype, leaftype):
+    def __init__(self, bpf, map_id, map_fd, keytype, leaftype, name=None):
         self.bpf = bpf
         self.map_id = map_id
         self.map_fd = map_fd
@@ -171,6 +288,10 @@ class TableBase(MutableMapping):
         self.ttype = lib.bpf_table_type_id(self.bpf.module, self.map_id)
         self.flags = lib.bpf_table_flags_id(self.bpf.module, self.map_id)
         self._cbs = {}
+        self._name = name
+
+    def get_fd(self):
+        return self.map_fd
 
     def key_sprintf(self, key):
         buf = ct.create_string_buffer(ct.sizeof(self.Key) * 8)
@@ -317,6 +438,15 @@ class TableBase(MutableMapping):
             tmp = {}
             f1 = self.Key._fields_[0][0]
             f2 = self.Key._fields_[1][0]
+
+            # The above code assumes that self.Key._fields_[1][0] holds the
+            # slot. But a padding member may have been inserted here, which
+            # breaks the assumption and leads to chaos.
+            # TODO: this is a quick fix. Fixing/working around in the BCC
+            # internal library is the right thing to do.
+            if f2 == '__pad_1' and len(self.Key._fields_) == 3:
+                f2 = self.Key._fields_[2][0]
+
             for k, v in self.items():
                 bucket = getattr(k, f1)
                 if bucket_fn:
@@ -528,6 +658,7 @@ class PerfEventArray(ArrayBase):
     def __init__(self, *args, **kwargs):
         super(PerfEventArray, self).__init__(*args, **kwargs)
         self._open_key_fds = {}
+        self._event_class = None
 
     def __del__(self):
         keys = list(self._open_key_fds.keys())
@@ -549,6 +680,18 @@ class PerfEventArray(ArrayBase):
             # The key is opened for perf event read
             lib.bpf_close_perf_event_fd(self._open_key_fds[key])
         del self._open_key_fds[key]
+
+    def event(self, data):
+        """event(data)
+
+        When perf buffers are opened to receive custom perf event,
+        the underlying event data struct which is defined in C in
+        the BPF program can be deduced via this function. This avoids
+        redundant definitions in Python.
+        """
+        if self._event_class == None:
+            self._event_class = _get_event_class(self)
+        return ct.cast(data, ct.POINTER(self._event_class)).contents
 
     def open_perf_buffer(self, callback, page_cnt=8, lost_cb=None):
         """open_perf_buffers(callback)
@@ -622,7 +765,7 @@ class PerCpuHash(HashTable):
         self.total_cpu = len(get_possible_cpus())
         # This needs to be 8 as hard coded into the linux kernel.
         self.alignment = ct.sizeof(self.sLeaf) % 8
-        if self.alignment is 0:
+        if self.alignment == 0:
             self.Leaf = self.sLeaf * self.total_cpu
         else:
             # Currently Float, Char, un-aligned structs are not supported
@@ -635,7 +778,7 @@ class PerCpuHash(HashTable):
 
     def getvalue(self, key):
         result = super(PerCpuHash, self).__getitem__(key)
-        if self.alignment is 0:
+        if self.alignment == 0:
             ret = result
         else:
             ret = (self.sLeaf * self.total_cpu)()
@@ -678,7 +821,7 @@ class PerCpuArray(ArrayBase):
         self.total_cpu = len(get_possible_cpus())
         # This needs to be 8 as hard coded into the linux kernel.
         self.alignment = ct.sizeof(self.sLeaf) % 8
-        if self.alignment is 0:
+        if self.alignment == 0:
             self.Leaf = self.sLeaf * self.total_cpu
         else:
             # Currently Float, Char, un-aligned structs are not supported
@@ -691,7 +834,7 @@ class PerCpuArray(ArrayBase):
 
     def getvalue(self, key):
         result = super(PerCpuArray, self).__getitem__(key)
-        if self.alignment is 0:
+        if self.alignment == 0:
             ret = result
         else:
             ret = (self.sLeaf * self.total_cpu)()
@@ -736,15 +879,20 @@ class LpmTrie(TableBase):
 
 class StackTrace(TableBase):
     MAX_DEPTH = 127
+    BPF_F_STACK_BUILD_ID = (1<<5)
+    BPF_STACK_BUILD_ID_EMPTY =  0 #can't get stacktrace
+    BPF_STACK_BUILD_ID_VALID = 1 #valid build-id,ip
+    BPF_STACK_BUILD_ID_IP = 2 #fallback to ip
 
     def __init__(self, *args, **kwargs):
         super(StackTrace, self).__init__(*args, **kwargs)
 
     class StackWalker(object):
-        def __init__(self, stack, resolve=None):
+        def __init__(self, stack, flags, resolve=None):
             self.stack = stack
             self.n = -1
             self.resolve = resolve
+            self.flags = flags
 
         def __iter__(self):
             return self
@@ -757,14 +905,21 @@ class StackTrace(TableBase):
             if self.n == StackTrace.MAX_DEPTH:
                 raise StopIteration()
 
-            addr = self.stack.ip[self.n]
+            if self.flags & StackTrace.BPF_F_STACK_BUILD_ID:
+              addr = self.stack.trace[self.n]
+              if addr.status == StackTrace.BPF_STACK_BUILD_ID_IP or \
+                 addr.status == StackTrace.BPF_STACK_BUILD_ID_EMPTY:
+                  raise StopIteration()
+            else:
+              addr = self.stack.ip[self.n]
+
             if addr == 0 :
                 raise StopIteration()
 
             return self.resolve(addr) if self.resolve else addr
 
     def walk(self, stack_id, resolve=None):
-        return StackTrace.StackWalker(self[self.Key(stack_id)], resolve)
+        return StackTrace.StackWalker(self[self.Key(stack_id)], self.flags, resolve)
 
     def __len__(self):
         i = 0
@@ -781,3 +936,120 @@ class DevMap(ArrayBase):
 class CpuMap(ArrayBase):
     def __init__(self, *args, **kwargs):
         super(CpuMap, self).__init__(*args, **kwargs)
+
+class XskMap(ArrayBase):
+    def __init__(self, *args, **kwargs):
+        super(XskMap, self).__init__(*args, **kwargs)
+
+class MapInMapArray(ArrayBase):
+    def __init__(self, *args, **kwargs):
+        super(MapInMapArray, self).__init__(*args, **kwargs)
+
+class MapInMapHash(HashTable):
+    def __init__(self, *args, **kwargs):
+        super(MapInMapHash, self).__init__(*args, **kwargs)
+
+class RingBuf(TableBase):
+    def __init__(self, *args, **kwargs):
+        super(RingBuf, self).__init__(*args, **kwargs)
+        self._ringbuf = None
+        self._event_class = None
+
+    def __delitem(self, key):
+        pass
+
+    def __del__(self):
+        pass
+
+    def __len__(self):
+        return 0
+
+    def event(self, data):
+        """event(data)
+
+        When ring buffers are opened to receive custom event,
+        the underlying event data struct which is defined in C in
+        the BPF program can be deduced via this function. This avoids
+        redundant definitions in Python.
+        """
+        if self._event_class == None:
+            self._event_class = _get_event_class(self)
+        return ct.cast(data, ct.POINTER(self._event_class)).contents
+
+    def open_ring_buffer(self, callback, ctx=None):
+        """open_ring_buffer(callback)
+
+        Opens a ring buffer to receive custom event data from the bpf program.
+        The callback will be invoked for each event submitted from the kernel,
+        up to millions per second.
+        """
+
+        def ringbuf_cb_(ctx, data, size):
+            try:
+                ret = callback(ctx, data, size)
+                # Callback for ringbufs should _always_ return an integer.
+                # If the function the user registers does not,
+                # simply fall back to returning 0.
+                try:
+                    ret = int(ret)
+                except:
+                    ret = 0
+            except IOError as e:
+                if e.errno == errno.EPIPE:
+                    exit()
+                else:
+                    raise e
+            return ret
+
+        fn = _RINGBUF_CB_TYPE(ringbuf_cb_)
+        self.bpf._open_ring_buffer(self.map_fd, fn, ctx)
+        # keep a refcnt
+        self._cbs[0] = fn
+
+class QueueStack:
+    # Flag for map.push
+    BPF_EXIST = 2
+
+    def __init__(self, bpf, map_id, map_fd, leaftype):
+        self.bpf = bpf
+        self.map_id = map_id
+        self.map_fd = map_fd
+        self.Leaf = leaftype
+        self.ttype = lib.bpf_table_type_id(self.bpf.module, self.map_id)
+        self.flags = lib.bpf_table_flags_id(self.bpf.module, self.map_id)
+
+    def leaf_sprintf(self, leaf):
+        buf = ct.create_string_buffer(ct.sizeof(self.Leaf) * 8)
+        res = lib.bpf_table_leaf_snprintf(self.bpf.module, self.map_id, buf,
+                                          len(buf), ct.byref(leaf))
+        if res < 0:
+            raise Exception("Could not printf leaf")
+        return buf.value
+
+    def leaf_scanf(self, leaf_str):
+        leaf = self.Leaf()
+        res = lib.bpf_table_leaf_sscanf(self.bpf.module, self.map_id, leaf_str,
+                                        ct.byref(leaf))
+        if res < 0:
+            raise Exception("Could not scanf leaf")
+        return leaf
+
+    def push(self, leaf, flags=0):
+        res = lib.bpf_update_elem(self.map_fd, None, ct.byref(leaf), flags)
+        if res < 0:
+            errstr = os.strerror(ct.get_errno())
+            raise Exception("Could not push to table: %s" % errstr)
+
+    def pop(self):
+        leaf = self.Leaf()
+        res = lib.bpf_lookup_and_delete(self.map_fd, None, ct.byref(leaf))
+        if res < 0:
+            raise KeyError("Could not pop from table")
+        return leaf
+
+    def peek(self):
+        leaf = self.Leaf()
+        res = lib.bpf_lookup_elem(self.map_fd, None, ct.byref(leaf))
+        if res < 0:
+            raise KeyError("Could not peek table")
+        return leaf

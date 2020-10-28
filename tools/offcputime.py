@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 #
 # offcputime    Summarize off-CPU time by stack trace
 #               For Linux, uses BCC, eBPF.
@@ -36,7 +36,7 @@ def positive_nonzero_int(val):
     return ival
 
 def stack_id_err(stack_id):
-    # -EFAULT in get_stackid normally means the stack-trace is not availible,
+    # -EFAULT in get_stackid normally means the stack-trace is not available,
     # Such as getting kernel stack trace in userspace code
     return (stack_id < 0) and (stack_id != -errno.EFAULT)
 
@@ -99,8 +99,6 @@ parser.add_argument("--state", type=positive_int,
 parser.add_argument("--ebpf", action="store_true",
     help=argparse.SUPPRESS)
 args = parser.parse_args()
-if args.pid and args.tgid:
-    parser.error("specify only one of -p and -t")
 folded = args.folded
 duration = int(args.duration)
 debug = 0
@@ -288,13 +286,15 @@ for k, v in sorted(counts.items(), key=lambda counts: counts[1].value):
             if stack_id_err(k.user_stack_id):
                 line.append("[Missed User Stack]")
             else:
-                line.extend([b.sym(addr, k.tgid) for addr in reversed(user_stack)])
+                line.extend([b.sym(addr, k.tgid).decode('utf-8', 'replace')
+                    for addr in reversed(user_stack)])
         if not args.user_stacks_only:
             line.extend(["-"] if (need_delimiter and k.kernel_stack_id >= 0 and k.user_stack_id >= 0) else [])
             if stack_id_err(k.kernel_stack_id):
                 line.append("[Missed Kernel Stack]")
             else:
-                line.extend([b.ksym(addr) for addr in reversed(kernel_stack)])
+                line.extend([b.ksym(addr).decode('utf-8', 'replace')
+                    for addr in reversed(kernel_stack)])
         print("%s %d" % (";".join(line), v.value))
     else:
         # print default multi-line stack output
