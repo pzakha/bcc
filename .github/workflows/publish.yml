@@ -1,6 +1,6 @@
 name: Publish Build Artifacts
 
-on: push
+on: []
 
 jobs:
   publish_images:
